@@ -272,6 +272,52 @@ proc semTemplSymbol(c: var UntypedCtx; dest: var TokenBuf; n: var Cursor; firstS
       dest.shrink start
       dest.add withoutGensyms
 
+## Walk a generic routine parameter's default value: bind type
+## parameters to symbols and keep dot/call forms unresolved.
+proc semGenericDefaultValue*(ctx: var UntypedCtx; dest: var TokenBuf; n: var Cursor) =
+  case n.kind
+  of Ident:
+    if isInjected(ctx, n.litId):
+      dest.add n
+      inc n
+      return
+    let start = dest.len
+    let count = buildSymChoice(ctx.c[], dest, n.litId, n.info, FindOverloads)
+    if count != 0:
+      var firstSymN = cursorAt(dest, start)
+      if firstSymN.kind == ParLe: inc firstSymN
+      assert firstSymN.kind == Symbol
+      let firstSym = firstSymN.symId
+      endRead(dest)
+      if firstSym in ctx.params:
+        assert count == 1
+        dest.shrink start
+        dest.add symToken(firstSym, n.info)
+      else:
+        semTemplSymbol(ctx, dest, n, firstSym, count, start)
+    inc n
+  of Symbol, IntLit, UIntLit, CharLit, StringLit, FloatLit, DotToken:
+    takeToken dest, n
+  of ParLe:
+    case n.exprKind
+    of DotX:
+      takeToken dest, n
+      semGenericDefaultValue ctx, dest, n
+      inc ctx.noGenSym
+      semGenericDefaultValue ctx, dest, n
+      dec ctx.noGenSym
+      if n.hasMore:
+        takeTree dest, n
+      takeParRi dest, n
+    else:
+      dest.add n
+      n.into:
+        while n.hasMore:
+          semGenericDefaultValue ctx, dest, n
+      dest.addParRi()
+  else:
+    takeToken dest, n
+
 proc semTemplBody*(c: var UntypedCtx; dest: var TokenBuf; n: var Cursor)
 
 proc semTemplBodySons(c: var UntypedCtx; dest: var TokenBuf; n: var Cursor) =

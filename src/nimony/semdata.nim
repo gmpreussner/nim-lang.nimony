@@ -21,6 +21,7 @@ type
     kind*: SymKind
     hasDefer*: bool
     inGeneric*, inLoop*, inBlock*, inInst*, inExcept*: int
+    typevarsAt*: int  # dest index of `(typevars ...)` for the current routine
     returnType*: TypeCursor
     pragmas*: set[PragmaKind]
     raisesType*: TypeCursor  # Type from .raises pragma (e.g., ErrorCode, MyError)
@@ -28,7 +29,7 @@ type
     parent*: SemRoutine
 
 proc createSemRoutine*(kind: SymKind; parent: SemRoutine): SemRoutine =
-  result = SemRoutine(kind: kind, parent: parent, resId: SymId(0))
+  result = SemRoutine(kind: kind, parent: parent, resId: SymId(0), typevarsAt: -1)
 
 const
   MaxNestedTemplates* = 100

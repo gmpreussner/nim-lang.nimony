@@ -160,6 +160,60 @@ proc semLocalValue(c: var SemContext; dest: var TokenBuf; it: var Item; crucial:
   else:
     semExpr c, dest, it
 
+proc typevarSymsAt(dest: var TokenBuf; typevarsAt: int): HashSet[SymId] =
+  result = initHashSet[SymId]()
+  var read = cursorAt(dest, typevarsAt)
+  if read.substructureKind == TypevarsU:
+    read.into:
+      while read.hasMore:
+        let tv = asLocal(read)
+        result.incl tv.name.symId
+        skip read
+  endRead(dest)
+
+proc defaultUsesTypevar(c: var SemContext; dest: var TokenBuf; n: Cursor; typevarsAt: int): bool =
+  result = false
+  let tvars = typevarSymsAt(dest, typevarsAt)
+  if tvars.len == 0:
+    return
+  var n = n
+  var nested = 0
+  while true:
+    case n.kind
+    of Ident:
+      var symsBuf = createTokenBuf(4)
+      let count = buildSymChoice(c, symsBuf, n.litId, n.info, FindOverloads)
+      if count == 1:
+        var symN = cursorAt(symsBuf, 0)
+        if symN.kind == ParLe: inc symN
+        if symN.kind == Symbol and symN.symId in tvars:
+          endRead(symsBuf)
+          return true
+      endRead(symsBuf)
+    of Symbol:
+      if n.symId in tvars:
+        return true
+    of ParLe:
+      inc nested
+    of ParRi:
+      dec nested
+      if nested == 0: break
+    else:
+      discard
+    inc n
+
+proc semParamDefaultValue(c: var SemContext; dest: var TokenBuf; it: var Item; crucial: CrucialPragma) =
+  ## Default values of generic routine parameters can mention type
+  ## parameters (e.g. `b: T = T.zero`). Sem-check them at instantiation
+  ## time when the type variables are known.
+  if c.routine.inGeneric > 0 and c.routine.typevarsAt >= 0 and
+      defaultUsesTypevar(c, dest, it.n, c.routine.typevarsAt):
+    var ctx = createUntypedContext(addr c, UntypedGeneric)
+    addParams(ctx, dest, c.routine.typevarsAt)
+    semGenericDefaultValue ctx, dest, it.n
+  else:
+    semLocalValue c, dest, it, crucial
+
 proc semLocal(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: SymKind) =
   let declStart = dest.len
   takeToken dest, n
@@ -198,6 +252,8 @@ proc semLocal(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: SymKin
         else:
           buildErr c, dest, it.n.info, "type or init value expected"
         dest.takeToken it.n
+      elif kind == ParamY:
+        semParamDefaultValue c, dest, it, crucial # 4
       else:
         semLocalValue c, dest, it, crucial # 4
       n = it.n
@@ -215,6 +271,8 @@ proc semLocal(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: SymKin
         if kind == ConstY:
           withNewScope c:
             semConstExpr c, dest, it # 4
+        elif kind == ParamY:
+          semParamDefaultValue c, dest, it, crucial # 4
         else:
           semLocalValue c, dest, it, crucial # 4
         n = it.n
@@ -841,6 +899,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
     c.openScope() # open parameter scope
     let beforeGenericParams = dest.len
     semGenericParams c, dest, it.n
+    c.routine.typevarsAt = beforeGenericParams
     if c.routine.inGeneric > 0 and c.routine.parent.kind != NoSym and c.routine.parent.inGeneric == 0:
       c.genericInnerProcs.incl(symId)
     let beforeParams = dest.len
