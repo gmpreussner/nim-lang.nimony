@@ -587,6 +587,39 @@ proc matchesConstraint*(m: var Match; f: var Cursor; a: Cursor): bool =
       return matchesConstraint(m, f, typevar.typ)
   result = matchesConstraintAux(m, f, a)
 
+proc foldPluginCall(m: var Match; a: Cursor): Cursor =
+  ## Re-drive the deferred plugin call `a` (`(pluginCall <template> <args>…)`)
+  ## with the bindings inferred so far. Returns the folded value, or
+  ## `default(Cursor)` while an argument is still symbolic or the plugin fails.
+  ##
+  ## The call is first re-semchecked in-process, which expands the plugin
+  ## exactly as instantiation would and keeps the template symbol resolved
+  ## even when the call site does not import the declaring module. Only if
+  ## that does not produce a value does it fall back to the `expreval`
+  ## sub-compile (`executeExpr`).
+  result = default(Cursor)
+  if m.context == nil: return
+  var subBuf = createTokenBuf(16)
+  substituteTypevars(subBuf, a, m.inferred)
+  var cur = cursorAt(subBuf, 0)
+  if containsGenericParams(cur): return
+  var buf = createTokenBuf(16)
+  if m.context.semExprCB != nil:
+    var it = Item(n: cur, typ: m.context.types.autoType)
+    m.context.semExprCB(m.context[], buf, it, {})
+    if buf.len > 0:
+      let r = cursorAt(buf, 0)
+      if not (r.isTagLit and r.cursorTagId in [nifpools.ErrT, cursorTagId(a)]):
+        return typeToCursor(m.context[], buf, 0)
+    buf = createTokenBuf(16)
+  if m.context.executeExpr == nil: return
+  var ec = initEvalContext(m.context, noExecute = false)
+  let folded = eval(ec, cur)
+  if folded.isTagLit and folded.cursorTagId == nifpools.ErrT: return
+  # `folded` lives in a temporary buffer; copy it before any other evaluation runs.
+  buf.addSubtree folded
+  result = typeToCursor(m.context[], buf, 0)
+
 proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
   ## The tiny fixed-opcode evaluator for compile-time *values* in type
   ## positions: folds `+ - *` over integer literals and rewrites an
@@ -632,22 +665,13 @@ proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
       result = foldValueExpr(m, typeValueExpr(a), depth+1)
     of PluginCallX:
       # A deferred plugin call in a value position (typically an array length
-      # `(pluginCall twicePlugin N)`). Substitute the bindings inferred so far;
-      # if that makes every argument concrete, re-drive the plugin through the
-      # shared `expreval` engine. This is the same engine `foldStaticArg` uses,
-      # but allowed to shell out to `executeExpr` here because a concrete plugin
-      # call is exactly what the deferral was waiting for. While any argument is
-      # still symbolic the call stays parked and is compared structurally.
+      # `(pluginCall twicePlugin N)`). While any argument is still symbolic the
+      # call stays parked and is compared structurally.
       assert m.context != nil
       assert m.context.executeExpr != nil
-      var subBuf = createTokenBuf(16)
-      substituteTypevars(subBuf, a, m.inferred)
-      var cur = cursorAt(subBuf, 0)
-      if not containsGenericParams(cur):
-        var ec = initEvalContext(m.context, noExecute = false)
-        let folded = eval(ec, cur)
-        if not (folded.isTagLit and folded.cursorTagId == nifpools.ErrT):
-          result = getConstOrdinalValue(folded)
+      let folded = foldPluginCall(m, a)
+      if folded != default(Cursor):
+        result = getConstOrdinalValue(folded)
     else:
       if a.typeKind == RangetypeT:
         # An array-index range. `semArrayType` stores a still-symbolic length as
@@ -1294,6 +1318,27 @@ proc linearMatchTree(m: var Match; f, a: var Cursor; fOrig, aOrig: Cursor;
       inc a
     else:
       m.error(ConstraintMismatch, f, a)
+  elif f.exprKind == PluginCallX and a.exprKind != PluginCallX:
+    # A deferred plugin call in a value slot of the formal, e.g. the shape in
+    # `StaticTensor[shapeOf([R, C]), T]`, against a concrete value. Fold it with
+    # the bindings known so far and compare the values. A call that is still
+    # symbolic cannot match: a value is never solved backwards. Two parked calls
+    # (a generic body checked before instantiation) fall through to the
+    # structural comparison below.
+    let folded = foldPluginCall(m, f)
+    if folded == default(Cursor):
+      m.error(InvalidMatch, fOrig, aOrig)
+    elif sameTrees(folded, a):
+      skip f
+      skip a
+    else:
+      let fv = foldValueExpr(m, folded)
+      let av = foldValueExpr(m, a)
+      if not fv.isNaN and not av.isNaN and fv == av:
+        skip f
+        skip a
+      else:
+        m.error(InvalidMatch, fOrig, aOrig)
   elif f.kind == a.kind:
     # Atoms are compared by their DECODED value, never by the raw token payload:
     # a literal of at most `StrInlineMaxLen` bytes is stored inside its token
